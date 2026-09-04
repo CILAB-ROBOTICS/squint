@@ -27,10 +27,11 @@ If you use this code in your research, kindly cite:
 
 ```bibtex
 @article{almuzairee2026squint,
-      title={Squint: Fast Visual Reinforcement Learning for Sim-to-Real Robotics}, 
-      author={Almuzairee, Abdulaziz and Christensen, Henrik I.},
-      journal={arXiv preprint arXiv:2602.21203},
-      year={2026}
+  title   = {Squint: Fast Visual Reinforcement Learning for Sim-to-Real Robotics},
+  author  = {Almuzairee, Abdulaziz and Christensen, Henrik I.},
+  journal = {IEEE Robotics and Automation Letters},
+  year    = {2026},
+  doi     = {10.1109/LRA.2026.3730387},
 }
 ```
 
