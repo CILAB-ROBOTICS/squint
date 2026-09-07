@@ -56,6 +56,7 @@ import envs  # noqa: F401
 import mani_skill.envs  # noqa: F401
 
 from deploy_utils.sim_real_agent import SimBackedRealAgent
+from deploy_utils.sim_calibrated_agent import CalibratedSimRealAgent, calibration_roundtrip_check
 
 from train_squint import DeployAgent
 
@@ -133,6 +134,8 @@ class Args:
     """Enable domain randomization on the inner (stand-in robot) simulation to inject a sim-to-sim gap."""
     inner_seed_offset: int = 0
     """Seed offset for the inner simulation relative to the outer one. 0 => identical scene layout (zero gap)."""
+    use_calibration: bool = False
+    """If True, route control through the real LeRobot + FeetechMotorsBus calibration path (emulated servos) instead of the plain sim stand-in."""
 
     # Wandb checkpoint download settings (only used when checkpoint='wandb')
     wandb_entity: Optional[str] = None  # CHANGE THIS: your wandb username/entity
@@ -275,6 +278,34 @@ def print_timing_stats(timing_stats: dict, episode_num: int, target_freq: int):
     print(f"Total:     {np.mean(timing_stats['total'])*1000:.1f}ms avg, "
           f"{np.max(timing_stats['total'])*1000:.1f}ms max")
     print(f"Achieved freq: {1/np.mean(timing_stats['total']):.1f} Hz (target: {target_freq} Hz)")
+
+
+def _print_calibration_report(real_agent):
+    """Print the loaded servo calibration and a round-trip check through the
+    full LeRobot + FeetechMotorsBus calibration path."""
+    bus = real_agent.real_robot.bus
+    print("\n" + "=" * 60)
+    print("CALIBRATION CHECK (LeRobot path, emulated servos)")
+    print(f"detected robot kind: {real_agent._robot_kind}")
+    print(f"gripper norm_mode:   {bus.motors['gripper'].norm_mode}")
+    print(f"\n{'motor':<14} {'id':<4} {'drive':<6} {'homing':<8} {'range_min':<10} {'range_max':<10}")
+    print("-" * 60)
+    for m, c in bus.calibration.items():
+        print(f"{m:<14} {c.id:<4} {c.drive_mode:<6} {c.homing_offset:<8} {c.range_min:<10} {c.range_max:<10}")
+    print("(homing_offset is loaded but not verifiable without hardware)")
+
+    names, max_err = calibration_roundtrip_check(real_agent)
+    print(f"\nround-trip |target - readback| (rad), max over samples:")
+    print(f"{'motor':<14} {'max_err':<12}")
+    print("-" * 28)
+    worst = 0.0
+    for n, e in zip(names, max_err):
+        flag = "  <-- CHECK" if e > 0.1 else ""
+        print(f"{n:<14} {e:<12.4f}{flag}")
+        worst = max(worst, float(e))
+    verdict = "PASS" if worst <= 0.1 else "WARN - calibration/conversion wiring likely wrong"
+    print(f"\nverdict: {verdict} (worst joint error {worst:.4f} rad)")
+    print("=" * 60 + "\n")
 
 
 def coerce_flag(x) -> bool:
@@ -474,13 +505,23 @@ def main(args: Args):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    real_agent = SimBackedRealAgent(
-        env_id=args.env_id,
-        env_kwargs=inner_env_kwargs,
-        device=device,
-        seed=args.seed + args.inner_seed_offset,
-        viewer=args.viewer,
-    )
+    if args.use_calibration:
+        real_agent = CalibratedSimRealAgent(
+            env_id=args.env_id,
+            env_kwargs=inner_env_kwargs,
+            device=device,
+            seed=args.seed + args.inner_seed_offset,
+            viewer=args.viewer,
+        )
+        _print_calibration_report(real_agent)
+    else:
+        real_agent = SimBackedRealAgent(
+            env_id=args.env_id,
+            env_kwargs=inner_env_kwargs,
+            device=device,
+            seed=args.seed + args.inner_seed_offset,
+            viewer=args.viewer,
+        )
 
     sim_env = gym.make(args.env_id, **env_kwargs)
     sim_env = FlattenRGBDObservationWrapper(sim_env, rgb=True, depth=False, state=True)
