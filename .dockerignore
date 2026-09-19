@@ -1,0 +1,5 @@
+.git
+results/
+docs/
+*.pyc
+__pycache__/
