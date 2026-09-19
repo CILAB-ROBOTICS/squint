@@ -252,11 +252,11 @@ class LiveCameraTuner:
 
     def _setup_exit(self):
         def cleanup(sig=None, frame=None):
-            try:
-                if self.real_agent and self.sim_env:
-                    self.real_agent.reset(self.sim_env.unwrapped.agent.keyframes["rest"].qpos)
-            except Exception:
-                pass
+            # try:
+            #     if self.real_agent and self.sim_env:
+            #         self.real_agent.reset(self.sim_env.unwrapped.agent.keyframes["rest"].qpos)
+            # except Exception:
+            #     pass
             try:
                 self.real_robot and self.real_robot.disconnect()
             except Exception:
