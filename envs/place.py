@@ -29,6 +29,9 @@ class PlaceRandomizationConfig(DefaultRandomizationConfig):
     # Can-specific randomization
     can_radius_range: Sequence[float] = (0.028 / 2, 0.038 / 2)
     can_half_height_range: Sequence[float] = (0.05 / 2, 0.07 / 2)
+    # Ball-specific randomization (table-tennis ball: 40mm diameter, 2.7g)
+    ball_radius_range: Sequence[float] = (0.02, 0.02)
+    ball_density_range: Sequence[float] = (80.57, 80.57)
     # Bin randomization (half sizes)
     bin_half_size_x_range: Sequence[float] = (0.07 / 2, 0.09 / 2)
     bin_half_size_y_range: Sequence[float] = (0.09 / 2, 0.11 / 2)
@@ -42,7 +45,7 @@ class PlaceRandomizationConfig(DefaultRandomizationConfig):
 class Place(DefaultCameraEnv):
     """
     **Task Description:**
-    Pick up an item (cube or can) and place it in a bin.
+    Pick up an item (cube, can, or ball) and place it in a bin.
 
     **Randomizations:**
     - the item's xy position is randomized on top of a table
@@ -123,7 +126,7 @@ class Place(DefaultCameraEnv):
         self.table_scene = TableSceneBuilder(self)
         self.table_scene.build()
 
-        if self.item_type not in ["cube", "can"]:
+        if self.item_type not in ["cube", "can", "ball"]:
             raise NotImplementedError(f"Unknown item_type: {self.item_type}")
 
         # Default values
@@ -204,6 +207,36 @@ class Place(DefaultCameraEnv):
             self.item_half_sizes = self.item_half_heights
             self.item_dimensions = torch.stack([self.item_half_radii, self.item_half_radii, self.item_half_heights], dim=-1)
 
+        elif self.item_type == "ball":
+            colors = np.ones((self.num_envs, 3))  # white table-tennis ball
+            ball_radii = (
+                np.ones(self.num_envs)
+                * (cfg.ball_radius_range[0] + cfg.ball_radius_range[1])
+                / 2
+            )
+            densities = (
+                np.ones(self.num_envs)
+                * (cfg.ball_density_range[0] + cfg.ball_density_range[1])
+                / 2
+            )
+            if self.domain_randomization:
+                ball_radii = self._batched_episode_rng.uniform(
+                    low=cfg.ball_radius_range[0],
+                    high=cfg.ball_radius_range[1],
+                )
+                densities = self._batched_episode_rng.uniform(
+                    low=cfg.ball_density_range[0],
+                    high=cfg.ball_density_range[1],
+                )
+                if cfg.randomize_item_color:
+                    colors = self._batched_episode_rng.uniform(low=0, high=1, size=(3,))
+                frictions = self._batched_episode_rng.uniform(
+                    low=cfg.item_friction_range[0],
+                    high=cfg.item_friction_range[1],
+                )
+            self.item_half_sizes = common.to_tensor(ball_radii, device=self.device)
+            self.item_dimensions = torch.stack([self.item_half_sizes] * 3, dim=-1)
+
         colors = np.concatenate([colors, np.ones((self.num_envs, 1))], axis=-1)
         self.item_frictions = common.to_tensor(frictions, device=self.device)
         self.item_densities = common.to_tensor(densities, device=self.device)
@@ -242,6 +275,16 @@ class Place(DefaultCameraEnv):
                     pose=cylinder_pose
                 )
                 builder.initial_pose = sapien.Pose(p=[0.2, 0, half_heights[i]])  # Offset to avoid collision with bin at creation
+
+            elif self.item_type == "ball":
+                builder.add_sphere_collision(
+                    radius=ball_radii[i], material=material, density=densities[i]
+                )
+                builder.add_sphere_visual(
+                    radius=ball_radii[i],
+                    material=sapien.render.RenderMaterial(base_color=colors[i]),
+                )
+                builder.initial_pose = sapien.Pose(p=[0.2, 0, ball_radii[i]])  # Offset to avoid collision with bin at creation
 
             builder.set_scene_idxs([i])
             item = builder.build(name=f"item-{i}")
@@ -550,3 +593,37 @@ class PlaceCube(Place):
 class PlaceCan(Place):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, item_type="can", **kwargs)
+
+
+@register_env("SO101PlacePingPong-v1", max_episode_steps=50)
+class PlacePingPong(Place):
+    """
+    Pick up a white table-tennis ball (40mm diameter, 2.7g, matching ITTF spec)
+    and place it into a white box (10.5 x 10.5cm, 4cm tall), sized to exactly
+    match the real hardware used for sim-to-real deployment.
+    """
+
+    def __init__(
+        self,
+        *args,
+        domain_randomization_config: Union[PlaceRandomizationConfig, dict] = None,
+        **kwargs,
+    ):
+        # Ball/box dimensions fixed to the real hardware (not randomized ranges)
+        pingpong_config = dict(
+            ball_radius_range=(0.02, 0.02),
+            ball_density_range=(80.57, 80.57),
+            bin_half_size_x_range=(0.0525, 0.0525),
+            bin_half_size_y_range=(0.0525, 0.0525),
+            bin_half_size_z_range=(0.02, 0.02),
+        )
+        if isinstance(domain_randomization_config, dict):
+            pingpong_config.update(domain_randomization_config)
+        elif isinstance(domain_randomization_config, PlaceRandomizationConfig):
+            pingpong_config = domain_randomization_config
+        super().__init__(
+            *args,
+            item_type="ball",
+            domain_randomization_config=pingpong_config,
+            **kwargs,
+        )
