@@ -496,9 +496,9 @@ class WristCameraEnv(BaseRandomEnv):
     # Base pose relative to gripper_link. Camera is on the opposite side of the
     # gripper: whole pose rotated 180deg about local-Z (grasp point is on that axis).
     # Stock rot was (-90, 91, -35.31). Tune with deploy_utils/tune_camera.py.
-    WRIST_CAMERA_BASE_POS = (0.0049, -0.0498, -0.0591)
-    WRIST_CAMERA_BASE_ROT_RAD = (np.deg2rad(90), np.deg2rad(89), np.deg2rad(35.31))  # radians (roll, pitch, yaw)
-    WRIST_CAMERA_FOV = np.deg2rad(71)  # 71 degrees
+    WRIST_CAMERA_BASE_POS = (0.0080, -0.0498, -0.0630)
+    WRIST_CAMERA_BASE_ROT_RAD = (np.deg2rad(79.0), np.deg2rad(109.0), np.deg2rad(36.0))
+    WRIST_CAMERA_FOV = np.deg2rad(67.0)
 
     def __init__(
         self,
