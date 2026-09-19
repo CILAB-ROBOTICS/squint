@@ -201,6 +201,7 @@ def evaluate(args, eval_envs, get_action_fn, logger, eval_output_dir, max_episod
 
     logger.total_eval_time += eval_time
     logger.log(d=eval_d, step=global_step)
+    return eval_d
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -564,6 +565,7 @@ if __name__ == "__main__":
     else:
         run_name = args.exp_name
     model_path = os.path.abspath(f"runs/{run_name}/ckpt.pt")
+    best_model_path = os.path.abspath(f"runs/{run_name}/best.pt")
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
 
     # Seeding
@@ -851,6 +853,7 @@ if __name__ == "__main__":
     global_step = 0
     pbar = tqdm.tqdm(total=args.total_timesteps, desc="steps")
     max_ep_ret = -float("inf")
+    best_eval_return = -float("inf")
     avg_returns = deque(maxlen=20)
     desc = ""
     d = {}
@@ -858,19 +861,29 @@ if __name__ == "__main__":
     for iteration in range(args.num_total_iterations + 2):  # +2 for final eval
         # Evaluate
         if args.eval_freq > 0 and ((global_step - args.num_envs) // args.eval_freq) < (global_step // args.eval_freq):
-            evaluate(args, eval_envs, get_eval_action, logger, eval_output_dir,
+            eval_d = evaluate(args, eval_envs, get_eval_action, logger, eval_output_dir,
                      max_episode_steps, global_step, pbar)
             if args.evaluate:
                 break
             if args.save_model:
-                torch.save({
+                ckpt = {
                     'encoder': encoder.state_dict(),
                     'actor': actor.state_dict(),
                     'critic': critic_target.state_dict(),
                     'log_alpha': log_alpha,
                     'global_step': global_step,
-                }, model_path)
+                }
+                torch.save(ckpt, model_path)
                 print(f"Step {global_step}: model checkpoint saved to {model_path}")
+
+                # Track and separately save the best-performing checkpoint seen so far
+                # (the code above always overwrites ckpt.pt with the LATEST eval,
+                # which is not necessarily the best one over the course of training).
+                eval_return = eval_d['eval/return'].item()
+                if eval_return > best_eval_return:
+                    best_eval_return = eval_return
+                    torch.save({**ckpt, 'eval_return': eval_return}, best_model_path)
+                    print(f"Step {global_step}: new best checkpoint (return={eval_return:.2f}) saved to {best_model_path}")
 
         # Collect
         if global_step < args.learning_starts:
