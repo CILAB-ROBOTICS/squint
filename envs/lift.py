@@ -35,6 +35,13 @@ class LiftRandomizationConfig(DefaultRandomizationConfig):
     randomize_item_color: bool = False
 
 
+@dataclass
+class LiftCanV2RandomizationConfig(LiftRandomizationConfig):
+    """Domain randomization config for the SO101LiftCan-v2 task, matching a real 55mm x 114mm can."""
+    can_radius_range: Sequence[float] = (0.055 / 2, 0.055 / 2)
+    can_half_height_range: Sequence[float] = (0.114 / 2, 0.114 / 2)
+
+
 class Lift(DefaultCameraEnv):
     """
     **Task Description:**
@@ -65,9 +72,11 @@ class Lift(DefaultCameraEnv):
         domain_randomization=False,
         spawn_box_pos=[0.3, 0],
         spawn_box_half_size=0.2 / 2,
+        can_color=(0, 0, 1),
         **kwargs,
     ):
         self.item_type = item_type
+        self.can_color = can_color
 
         # Robot-specific configuration
         if robot_uids == "so100":
@@ -159,8 +168,9 @@ class Lift(DefaultCameraEnv):
             self.item_dimensions = torch.stack([self.item_half_sizes] * 3, dim=-1)
 
         elif self.item_type == "can":
-            colors[:, :] = 0
-            colors[:, 2] = 1 # blue
+            colors[:, 0] = self.can_color[0]
+            colors[:, 1] = self.can_color[1]
+            colors[:, 2] = self.can_color[2]
             half_radii = (
                 np.ones(self.num_envs)
                 * (
@@ -413,3 +423,28 @@ class LiftCube(Lift):
 class LiftCan(Lift):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, item_type="can", **kwargs)
+
+
+@register_env("SO101LiftCan-v2", max_episode_steps=50)
+class LiftCanV2(Lift):
+    """Same as SO101LiftCan-v1, but with a can matching a real 55mm diameter x 114mm height
+    sky-blue can (rgb(95,197,231))."""
+
+    def __init__(
+        self,
+        *args,
+        domain_randomization_config: Union[
+            LiftCanV2RandomizationConfig, dict
+        ] = LiftCanV2RandomizationConfig(),
+        # can_color=(95 / 255, 197 / 255, 231 / 255),
+        # can_color=(58 / 255, 217 / 255, 231 / 255),
+        can_color=(41 / 255, 140 / 255, 238 / 255),
+        **kwargs,
+    ):
+        super().__init__(
+            *args,
+            item_type="can",
+            domain_randomization_config=domain_randomization_config,
+            can_color=can_color,
+            **kwargs,
+        )
