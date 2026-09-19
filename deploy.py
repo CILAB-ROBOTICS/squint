@@ -50,6 +50,24 @@ from deploy_utils.robot_config import create_real_robot
 
 from train_squint import DeployAgent
 
+
+class StableSim2RealEnv(Sim2RealEnv):
+    """
+    Work around ManiSkill Sim2RealEnv recursion when gym wrappers
+    temporarily replace the underlying env.
+    """
+
+    def __init__(self, sim_env, *args, **kwargs):
+        # Store the true BaseEnv before Sim2RealEnv starts manipulating
+        # the wrapper chain.
+        self._stable_base_sim_env = sim_env.unwrapped
+        super().__init__(sim_env=sim_env, *args, **kwargs)
+
+    @property
+    def base_sim_env(self):
+        return self._stable_base_sim_env
+
+
 # ============================================================
 # ARGUMENTS
 # ============================================================
@@ -406,7 +424,7 @@ def main(args: Args):
         )
 
     preprocessor = create_wrist_camera_preprocessor(sim_env.unwrapped)
-    real_env = Sim2RealEnv(
+    real_env = StableSim2RealEnv(
         sim_env=sim_env,
         agent=real_agent,
         control_freq=args.control_freq,
