@@ -43,6 +43,7 @@ import torch
 import tyro
 import cv2
 import matplotlib.pyplot as plt
+from sapien.render import RenderBodyComponent
 from tqdm import tqdm
 
 from mani_skill.envs.sim2real_env import Sim2RealEnv
@@ -136,6 +137,8 @@ class Args:
     """Seed offset for the inner simulation relative to the outer one. 0 => identical scene layout (zero gap)."""
     use_calibration: bool = False
     """If True, route control through the real LeRobot + FeetechMotorsBus calibration path (emulated servos) instead of the plain sim stand-in."""
+    table_color: Optional[tuple[float, float, float]] = None
+    """If set, recolor just the table's render material (not the full background) to this RGB (0-1) color on the inner ('real') env, matching a real setup where only the table is covered (e.g. by black paper)."""
 
     # Wandb checkpoint download settings (only used when checkpoint='wandb')
     wandb_entity: Optional[str] = None  # CHANGE THIS: your wandb username/entity
@@ -199,6 +202,25 @@ def create_wrist_camera_preprocessor(sim_env):
         return sensor_data
 
     return preprocess
+
+
+def recolor_table(env, color: tuple[float, float, float]):
+    """Recolor a task env's table render material directly, e.g. to emulate a real table
+    covered in colored/black paper. The table's wood material ships with a base_color_texture
+    (diffuse image), and the renderer does not multiply that texture by base_color, so the
+    texture must be cleared first or it would still show through."""
+    rgba = list(color) + [1]
+    for obj in env.unwrapped.table_scene.table._objs:
+        # `link._objs` elements wrap a sapien Entity behind `.entity`, but Actor's `_objs`
+        # (e.g. the table) are already the raw sapien.pysapien.Entity.
+        entity = obj.entity if hasattr(obj, "entity") else obj
+        render_body_component = entity.find_component_by_type(RenderBodyComponent)
+        if render_body_component is None:
+            continue
+        for render_shape in render_body_component.render_shapes:
+            for part in render_shape.parts:
+                part.material.set_base_color_texture(None)
+                part.material.set_base_color(rgba)
 
 
 def make_sim_real_reset(inner_seed_offset: int):
@@ -494,10 +516,14 @@ def main(args: Args):
     # The inner simulation stands in for the real robot. It needs a computable
     # reward mode so we can report success/return, and it can optionally diverge
     # from the outer env (domain randomization / seed) to inject a sim-to-sim gap.
+    # apply_overlay is forced off: a real camera can't green-screen its
+    # background, so leaving it on (the env default) would let the inner sim
+    # feed the policy a black background it could never see on real hardware.
     inner_env_kwargs = dict(
         obs_mode=args.obs_mode,
         max_episode_steps=args.max_episode_steps,
         domain_randomization=args.inner_domain_randomization,
+        domain_randomization_config=dict(apply_overlay=False),
         reward_mode="normalized_dense",
         control_mode=args.control_mode,
         sensor_configs=dict(width=args.image_size, height=args.image_size),
@@ -522,6 +548,9 @@ def main(args: Args):
             seed=args.seed + args.inner_seed_offset,
             viewer=args.viewer,
         )
+
+    if args.table_color is not None:
+        recolor_table(real_agent.inner_env, args.table_color)
 
     sim_env = gym.make(args.env_id, **env_kwargs)
     sim_env = FlattenRGBDObservationWrapper(sim_env, rgb=True, depth=False, state=True)
