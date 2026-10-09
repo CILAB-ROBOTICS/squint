@@ -1,22 +1,29 @@
 """
-Deploy a trained RL agent on a real SO101/SO100 robot.
+Evaluate a trained RL agent in simulation using the *real* deployment code path.
 
-This script handles:
-- Connecting to the real robot with either OpenCV (wrist) or RealSense camera
-- Loading a trained checkpoint from local path or wandb
-- Running evaluation episodes with keyboard controls
+This is the sim-to-sim counterpart of `deploy.py`. Instead of driving a physical
+SO101/SO100 arm, it plugs a simulation-backed fake robot (`SimBackedRealAgent`)
+into the exact same `Sim2RealEnv` pipeline that `deploy.py` uses. The policy's
+target-qpos signal is "intercepted" and replayed inside a second simulation
+instance, so you can shake out the whole deploy pipeline (sensor preprocessing,
+controller alignment, timing, safe-exit, recording, wandb checkpoint loading)
+without any hardware. Because the stand-in robot is itself a simulation we also
+get ground-truth success / return, which is reported per episode.
 
 Usage:
-    python deploy.py --checkpoint path/to/checkpoint.pt --env_id SO101ReachCube-v1
-    python deploy.py --checkpoint wandb --env_id SO101ReachCube-v1  # Load from wandb
-    python deploy.py --env_id SO101ReachCube-v1  # Random agent (no checkpoint)
+    python deploy_sim.py --checkpoint path/to/checkpoint.pt --env_id SO101ReachCube-v1
+    python deploy_sim.py --checkpoint wandb --env_id SO101ReachCube-v1
+    python deploy_sim.py --env_id SO101ReachCube-v1                       # random agent
+    python deploy_sim.py --env_id SO101ReachCube-v1 --interactive False   # auto N episodes
+    python deploy_sim.py --env_id SO101ReachCube-v1 --viewer              # live SAPIEN 3D view
 
-Keyboard Controls:
+Keyboard Controls (interactive mode):
     's' - Skip current episode
     'q' - Quit evaluation
 """
 
 from dataclasses import dataclass
+import contextlib
 import random
 from typing import Optional
 from pathlib import Path
@@ -36,6 +43,7 @@ import torch
 import tyro
 import cv2
 import matplotlib.pyplot as plt
+from sapien.render import RenderBodyComponent
 from tqdm import tqdm
 
 from mani_skill.envs.sim2real_env import Sim2RealEnv
@@ -44,29 +52,42 @@ from mani_skill.sensors.camera import CameraConfig
 from mani_skill.utils import common
 from mani_skill.utils.visualization import tile_images
 
+# Registers the SO101* task ids.
+import envs  # noqa: F401
+import mani_skill.envs  # noqa: F401
 
-from deploy_utils.manipulator import LeRobotRealAgent
-from deploy_utils.robot_config import create_real_robot
+from deploy_utils.sim_real_agent import SimBackedRealAgent
+from deploy_utils.sim_calibrated_agent import CalibratedSimRealAgent, calibration_roundtrip_check
 
 from train_squint import DeployAgent
 
 
-class StableSim2RealEnv(Sim2RealEnv):
-    """
-    Work around ManiSkill Sim2RealEnv recursion when gym wrappers
-    temporarily replace the underlying env.
+class SimToSimEnv(Sim2RealEnv):
+    """`Sim2RealEnv` with `base_sim_env` pinned to the real task env.
+
+    Stock `Sim2RealEnv.base_sim_env` resolves via `self.sim_env.unwrapped`, which
+    during the wrapper-swap performed inside `reset()`/`step()` walks into the
+    internal `RealEnvStepReset` whose `.unwrapped` points back at the
+    `Sim2RealEnv` -- making `base_sim_env.__class__.get_obs(...)` recurse forever.
+    Pinning the underlying task env at construction time avoids that.
     """
 
-    def __init__(self, sim_env, *args, **kwargs):
-        # Store the true BaseEnv before Sim2RealEnv starts manipulating
-        # the wrapper chain.
-        self._stable_base_sim_env = sim_env.unwrapped
-        super().__init__(sim_env=sim_env, *args, **kwargs)
+    def __init__(self, sim_env, *args, throttle: bool = True, **kwargs):
+        self._pinned_base_sim_env = sim_env.unwrapped
+        self._throttle = throttle
+        super().__init__(sim_env, *args, **kwargs)
 
     @property
     def base_sim_env(self):
-        return self._stable_base_sim_env
+        return self._pinned_base_sim_env
 
+    def _step_action(self, action):
+        # When not emulating real-time control, skip the wall-clock throttle in
+        # the parent (which otherwise logs a "Control dt not reached" warning
+        # every single step).
+        if not self._throttle:
+            self.last_control_time = None
+        return super()._step_action(action)
 
 # ============================================================
 # ARGUMENTS
@@ -87,7 +108,9 @@ class Args:
     continuous_eval: bool = True
     """If True, runs without pausing. If False, waits for Enter at each step."""
     control_freq: Optional[int] = 30
-    """Control frequency in Hz. Recommended: 15 or lower for safety."""
+    """Control frequency in Hz. Only enforced as a real-time throttle when --realtime is set."""
+    realtime: bool = False
+    """If True, throttle each step to control_freq (like the real robot). If False, run as fast as possible."""
     action_scale: float = 0.15
     """Action scaling factor. Values < 1.0 make movements smaller/slower."""
     record_dir: Optional[str] = None
@@ -96,10 +119,26 @@ class Args:
     """Resolution (HxW) for each frame in the recorded video. Use 128, 256, or 480."""
     debug: bool = False
     """If True, shows sim/real overlay visualization."""
+    viewer: bool = False
+    """If True, open a live SAPIEN 3D viewer on the inner (stand-in robot) simulation."""
     seed: int = 1
     """Random seed for reproducibility."""
     image_size: int = 128
     """HxW of input image to agent"""
+
+    # Sim-to-sim evaluation settings
+    interactive: bool = True
+    """If True, drive episodes with the keyboard. If False, auto-run num_eval_episodes and print a summary."""
+    num_eval_episodes: int = 10
+    """Number of episodes to run in non-interactive mode."""
+    inner_domain_randomization: bool = False
+    """Enable domain randomization on the inner (stand-in robot) simulation to inject a sim-to-sim gap."""
+    inner_seed_offset: int = 0
+    """Seed offset for the inner simulation relative to the outer one. 0 => identical scene layout (zero gap)."""
+    use_calibration: bool = False
+    """If True, route control through the real LeRobot + FeetechMotorsBus calibration path (emulated servos) instead of the plain sim stand-in."""
+    table_color: Optional[tuple[float, float, float]] = None
+    """If set, recolor just the table's render material (not the full background) to this RGB (0-1) color on the inner ('real') env, matching a real setup where only the table is covered (e.g. by black paper)."""
 
     # Wandb checkpoint download settings (only used when checkpoint='wandb')
     wandb_entity: Optional[str] = None  # CHANGE THIS: your wandb username/entity
@@ -165,6 +204,42 @@ def create_wrist_camera_preprocessor(sim_env):
     return preprocess
 
 
+def recolor_table(env, color: tuple[float, float, float]):
+    """Recolor a task env's table render material directly, e.g. to emulate a real table
+    covered in colored/black paper. The table's wood material ships with a base_color_texture
+    (diffuse image), and the renderer does not multiply that texture by base_color, so the
+    texture must be cleared first or it would still show through."""
+    rgba = list(color) + [1]
+    for obj in env.unwrapped.table_scene.table._objs:
+        # `link._objs` elements wrap a sapien Entity behind `.entity`, but Actor's `_objs`
+        # (e.g. the table) are already the raw sapien.pysapien.Entity.
+        entity = obj.entity if hasattr(obj, "entity") else obj
+        render_body_component = entity.find_component_by_type(RenderBodyComponent)
+        if render_body_component is None:
+            continue
+        for render_shape in render_body_component.render_shapes:
+            for part in render_shape.parts:
+                part.material.set_base_color_texture(None)
+                part.material.set_base_color(rgba)
+
+
+def make_sim_real_reset(inner_seed_offset: int):
+    """Build a `real_reset_function` for `Sim2RealEnv` (no 'press enter' prompt).
+
+    Draws an explicit seed so the inner (stand-in robot) simulation can be reset
+    to the *same* scene layout as the outer sim env (offset 0 => zero gap).
+    """
+
+    def sim_real_reset(env, seed=None, options=None):
+        if seed is None:
+            seed = int(np.random.randint(0, 2**31 - 1))
+        env.sim_env.reset(seed=seed, options=options)
+        qpos = env.base_sim_env.agent.robot.qpos.cpu().flatten()
+        env.agent.reset(qpos=qpos, seed=seed + inner_seed_offset, options=options)
+
+    return sim_real_reset
+
+
 def setup_safe_exit(sim_env, real_env, real_agent, recorder=None):
     """Register handlers for graceful shutdown on Ctrl+C or script exit."""
     def cleanup():
@@ -227,10 +302,41 @@ def print_timing_stats(timing_stats: dict, episode_num: int, target_freq: int):
     print(f"Achieved freq: {1/np.mean(timing_stats['total']):.1f} Hz (target: {target_freq} Hz)")
 
 
-def silent_reset(env, seed=None, options=None):
-    """Reset function without the 'Press enter' prompt."""
-    env.sim_env.reset(seed=seed, options=options)
-    env.agent.reset(qpos=env.base_sim_env.agent.robot.qpos.cpu().flatten())
+def _print_calibration_report(real_agent):
+    """Print the loaded servo calibration and a round-trip check through the
+    full LeRobot + FeetechMotorsBus calibration path."""
+    bus = real_agent.real_robot.bus
+    print("\n" + "=" * 60)
+    print("CALIBRATION CHECK (LeRobot path, emulated servos)")
+    print(f"detected robot kind: {real_agent._robot_kind}")
+    print(f"gripper norm_mode:   {bus.motors['gripper'].norm_mode}")
+    print(f"\n{'motor':<14} {'id':<4} {'drive':<6} {'homing':<8} {'range_min':<10} {'range_max':<10}")
+    print("-" * 60)
+    for m, c in bus.calibration.items():
+        print(f"{m:<14} {c.id:<4} {c.drive_mode:<6} {c.homing_offset:<8} {c.range_min:<10} {c.range_max:<10}")
+    print("(homing_offset is loaded but not verifiable without hardware)")
+
+    names, max_err = calibration_roundtrip_check(real_agent)
+    print(f"\nround-trip |target - readback| (rad), max over samples:")
+    print(f"{'motor':<14} {'max_err':<12}")
+    print("-" * 28)
+    worst = 0.0
+    for n, e in zip(names, max_err):
+        flag = "  <-- CHECK" if e > 0.1 else ""
+        print(f"{n:<14} {e:<12.4f}{flag}")
+        worst = max(worst, float(e))
+    verdict = "PASS" if worst <= 0.1 else "WARN - calibration/conversion wiring likely wrong"
+    print(f"\nverdict: {verdict} (worst joint error {worst:.4f} rad)")
+    print("=" * 60 + "\n")
+
+
+def coerce_flag(x) -> bool:
+    """Turn a possibly-batched tensor/array/scalar success flag into a python bool."""
+    if isinstance(x, torch.Tensor):
+        return bool(x.flatten()[0].item())
+    if isinstance(x, np.ndarray):
+        return bool(x.flatten()[0])
+    return bool(x)
 
 
 def select_best_wandb_seed(entity: str, project: str, agent_name: str, env_id: str, seeds: list[int], version: str = "latest") -> Optional[int]:
@@ -395,11 +501,7 @@ def main(args: Args):
     # --------------------------------------------------
     # Phase 1: Robot & Environment Setup
     # --------------------------------------------------
-    print("Setting up robot and environment...")
-
-    real_robot = create_real_robot()
-    real_robot.connect()
-    real_agent = LeRobotRealAgent(real_robot)
+    print("Setting up stand-in robot and environment...")
 
     env_kwargs = dict(
         obs_mode=args.obs_mode,
@@ -410,6 +512,45 @@ def main(args: Args):
         control_mode=args.control_mode,
         sensor_configs=dict(width=args.image_size, height=args.image_size)
     )
+
+    # The inner simulation stands in for the real robot. It needs a computable
+    # reward mode so we can report success/return, and it can optionally diverge
+    # from the outer env (domain randomization / seed) to inject a sim-to-sim gap.
+    # apply_overlay is forced off: a real camera can't green-screen its
+    # background, so leaving it on (the env default) would let the inner sim
+    # feed the policy a black background it could never see on real hardware.
+    inner_env_kwargs = dict(
+        obs_mode=args.obs_mode,
+        max_episode_steps=args.max_episode_steps,
+        domain_randomization=args.inner_domain_randomization,
+        domain_randomization_config=dict(apply_overlay=False),
+        reward_mode="normalized_dense",
+        control_mode=args.control_mode,
+        sensor_configs=dict(width=args.image_size, height=args.image_size),
+    )
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.use_calibration:
+        real_agent = CalibratedSimRealAgent(
+            env_id=args.env_id,
+            env_kwargs=inner_env_kwargs,
+            device=device,
+            seed=args.seed + args.inner_seed_offset,
+            viewer=args.viewer,
+        )
+        _print_calibration_report(real_agent)
+    else:
+        real_agent = SimBackedRealAgent(
+            env_id=args.env_id,
+            env_kwargs=inner_env_kwargs,
+            device=device,
+            seed=args.seed + args.inner_seed_offset,
+            viewer=args.viewer,
+        )
+
+    if args.table_color is not None:
+        recolor_table(real_agent.inner_env, args.table_color)
 
     sim_env = gym.make(args.env_id, **env_kwargs)
     sim_env = FlattenRGBDObservationWrapper(sim_env, rgb=True, depth=False, state=True)
@@ -424,12 +565,13 @@ def main(args: Args):
         )
 
     preprocessor = create_wrist_camera_preprocessor(sim_env.unwrapped)
-    real_env = StableSim2RealEnv(
+    real_env = SimToSimEnv(
         sim_env=sim_env,
         agent=real_agent,
         control_freq=args.control_freq,
         sensor_data_preprocessing_function=preprocessor,
-        real_reset_function=silent_reset
+        real_reset_function=make_sim_real_reset(args.inner_seed_offset),
+        throttle=args.realtime,
     )
 
     sim_obs, _ = sim_env.reset()
@@ -445,8 +587,7 @@ def main(args: Args):
     # Phase 2: Agent Loading
     # --------------------------------------------------
     print("\nLoading agent...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+
     agent = DeployAgent(sim_env, sample_obs=real_obs)
 
     if args.checkpoint:
@@ -477,7 +618,7 @@ def main(args: Args):
     agent.to(device)
 
     # --------------------------------------------------
-    # Phase 3: Debug Visualization Setup 
+    # Phase 3: Debug Visualization Setup
     # --------------------------------------------------
     if args.debug:
         fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(6, 12))
@@ -489,43 +630,59 @@ def main(args: Args):
         im2 = ax2.imshow(sim_img)
         ax2.set_title('Simulation')
         im3 = ax3.imshow(real_img)
-        ax3.set_title('Real')
+        ax3.set_title('Real (inner sim)')
         plt.tight_layout()
 
     # --------------------------------------------------
     # Phase 4: Evaluation Loop
     # --------------------------------------------------
     print("\n" + "=" * 40)
-    print("KEYBOARD CONTROLS")
-    print("  's' - Skip to next episode")
-    print("  'q' - Quit evaluation")
+    if args.interactive:
+        print("KEYBOARD CONTROLS")
+        print("  's' - Skip to next episode")
+        print("  'q' - Quit evaluation")
+    else:
+        print(f"AUTO EVAL: {args.num_eval_episodes} episodes")
     print("=" * 40 + "\n")
 
     episode_count = 0
+    episode_stats = []  # list of (return, success_once, success_at_end)
     timing_stats = {"inference": [], "step": [], "total": []}
 
-    with KeyboardController() as kb:
+    kb_ctx = KeyboardController() if args.interactive else contextlib.nullcontext()
+    with kb_ctx as kb:
         while True:
             print("=============================")
-            print(f"Episode {episode_count} - Press Enter to start, 'q' to quit")
-            while (key := kb.check_key()) not in ('\n', '\r', 'q'):
-                time.sleep(0.01)
-            if key == 'q':
-                print("[Quitting...]")
-                break
+            if args.interactive:
+                print(f"Episode {episode_count} - Press Enter to start, 'q' to quit")
+                while (key := kb.check_key()) not in ('\n', '\r', 'q'):
+                    time.sleep(0.01)
+                if key == 'q':
+                    print("[Quitting...]")
+                    break
+            else:
+                if episode_count >= args.num_eval_episodes:
+                    break
+                key = None
+                print(f"Episode {episode_count} / {args.num_eval_episodes}")
+
             skip_episode = False
+            ep_return = 0.0
+            ep_success_once = False
+            ep_success_at_end = False
 
             for _ in tqdm(range(args.max_episode_steps), desc="Steps"):
-                key = kb.check_key()
-                if key == 's':
-                    print("\n[Skipping episode...]")
-                    real_obs, _ = real_env.reset()
-                    skip_episode = True
-                    break
-                elif key == 'q':
-                    print("\n[Quitting...]")
-                    skip_episode = True
-                    break
+                if args.interactive:
+                    key = kb.check_key()
+                    if key == 's':
+                        print("\n[Skipping episode...]")
+                        real_obs, _ = real_env.reset()
+                        skip_episode = True
+                        break
+                    elif key == 'q':
+                        print("\n[Quitting...]")
+                        skip_episode = True
+                        break
 
                 loop_start = time.perf_counter()
 
@@ -540,12 +697,19 @@ def main(args: Args):
 
                 action = action.cpu().numpy()
                 scaled_action = np.clip(action * args.action_scale, -1, 1)
+                real_agent.pending_action = scaled_action
 
                 t0 = time.perf_counter()
                 real_obs, _, terminated, truncated, info = real_env.step(scaled_action)
                 timing_stats["step"].append(time.perf_counter() - t0)
 
                 timing_stats["total"].append(time.perf_counter() - loop_start)
+
+                # Ground-truth metrics come from the inner (stand-in) simulation.
+                step_success = coerce_flag(real_agent.last_info.get("success", False))
+                ep_return += real_agent.last_reward
+                ep_success_once = ep_success_once or step_success
+                ep_success_at_end = step_success
 
                 # Async recording: push frame without blocking
                 if recorder:
@@ -570,6 +734,13 @@ def main(args: Args):
                 break
 
             print_timing_stats(timing_stats, episode_count, args.control_freq)
+            if not skip_episode:
+                print(f"--- Eval Stats (Episode {episode_count}) ---")
+                print(f"return:         {ep_return:.3f}")
+                print(f"success_once:   {ep_success_once}")
+                print(f"success_at_end: {ep_success_at_end}")
+                episode_stats.append((ep_return, ep_success_once, ep_success_at_end))
+
             if recorder and recorder.queue_size > 0:
                 print(f"  Recorder queue: {recorder.queue_size} frames pending write")
             timing_stats = {"inference": [], "step": [], "total": []}
@@ -582,6 +753,18 @@ def main(args: Args):
 
             if not skip_episode:
                 real_obs, _ = real_env.reset()
+
+    # Summary over all completed episodes
+    if episode_stats:
+        rets = np.array([s[0] for s in episode_stats], dtype=np.float64)
+        so = np.array([s[1] for s in episode_stats], dtype=np.float64)
+        se = np.array([s[2] for s in episode_stats], dtype=np.float64)
+        print("\n" + "=" * 40)
+        print(f"=== Summary over {len(episode_stats)} episodes ===")
+        print(f"success_once:   {so.mean():.3f}")
+        print(f"success_at_end: {se.mean():.3f}")
+        print(f"return:         {rets.mean():.3f} +/- {rets.std():.3f}")
+        print("=" * 40)
 
     # Cleanup
     print("\nReturning robot to rest position...")

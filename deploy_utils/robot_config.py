@@ -29,7 +29,7 @@ def create_real_robot() -> Robot:
         #     width=640,
         #     height=480
         # )},
-        id="so101_follower_arm", # CHANGE THIS: your calibration file name
+        id="so101_follower", # CHANGE THIS: your calibration file name
         calibration_dir=Path(__file__).parent,  # CHANGE THIS: path to calibration file directory
     )
 
